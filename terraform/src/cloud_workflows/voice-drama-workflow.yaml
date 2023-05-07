@@ -265,7 +265,7 @@ PositiveSet:
                 - result.intonationScale : 1
                 - result.volumeScale : 1.6
 
-        - すんだもんorめたん(ポジティブ):
+        - 1.すんだもんorめたん(ポジティブ):
             switch:
                 - condition: ${speaker_str == "ずんだもん"}
                   steps:
@@ -278,7 +278,7 @@ PositiveSet:
                     - めたん(あまあま):
                         assign:
                             - result.speaker_id: 0
-        - 返却:
+        - 2.返却:
             return : ${result}
 
 BigNegativeSet:
