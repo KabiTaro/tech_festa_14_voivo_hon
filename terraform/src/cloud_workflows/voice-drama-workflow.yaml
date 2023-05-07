@@ -1,0 +1,380 @@
+main:
+    params: [input]
+    steps:
+    - 変数初期化:
+        assign:
+            # LINE BOTの配信有無を制御するフラグ
+            - is_post_messages_line_bot : ${default(map.get(input, "is_post_messages_line_bot"), 0)}
+            # LINE BOTに配信するメッセージ用の変数
+            - voice_drama_scripts : ${"本日"+text.split(time.format(sys.now(), "Asia/Tokyo"), "T")[0]+"のボイスドラマ"}
+            # Cloud Functionsのホスト名
+            - cloud_function_baseurl : ${"https://"+ sys.get_env("GOOGLE_CLOUD_LOCATION") + "-" + sys.get_env("GOOGLE_CLOUD_PROJECT_ID") + ".cloudfunctions.net"}
+
+    - 1.OpenAIから台本テキストを取得する:
+        call: GetOpenAISentense
+        result: open_ai_sentense
+
+    - 2.OpenAIの台本テキストをプログラムで処理できるよう構造体を要素として持つ配列に変換する:
+        call: http.post
+        args:
+            url: ${cloud_function_baseurl + "/parse_openai_script"}
+            body:
+                open_ai_text : ${open_ai_sentense}
+            auth:
+                type: OIDC
+        result: openai_script_structuries
+
+    - 3.イテレーションで分解した台詞毎に処理:
+        for:
+            value: openai_script_structure
+            in: ${openai_script_structuries.body}
+            steps:
+            - 3-1.分解した台詞テキストの感情分析値取得する:
+                call: googleapis.language.v1.documents.analyzeSentiment
+                args:
+                  body:
+                    document:
+                      content: ${openai_script_structure.text}
+                      language: JA
+                      type: PLAIN_TEXT
+                    encodingType: UTF8
+                result: analyzeSentimentResult
+
+            - 3-2.感情分析値からSpeakerID,音声データのパラメータを決定する:
+                call: CheckSentitiveScore
+                args:
+                  speaker_str: ${openai_script_structure.speaker}
+                  score: ${analyzeSentimentResult.documentSentiment.score}
+                  magnitude: ${analyzeSentimentResult.documentSentiment.magnitude}
+                result: check_sentitive_score_result
+
+            - 3-3.分解した台詞テキストを基にVOICEVOX ENGINEで音声合成用クエリを作成する:
+                call: http.post
+                args:
+                  url: ${cloud_function_baseurl + "/get_audio_query"}
+                  body:
+                    speaker_id: ${check_sentitive_score_result.speaker_id}
+                    query_text: ${openai_script_structure.text}
+                  auth:
+                    type: OIDC
+                result: audio_query
+
+            - 音声合成用クエリの音声パラメータの一部を3-2で決定したパラメータに上書きする:
+                assign:
+                  - audio_query.body.speedScale: ${check_sentitive_score_result.speedScale}
+                  - audio_query.body.pitchScale: ${check_sentitive_score_result.pitchScale}
+                  - audio_query.body.intonationScale: ${check_sentitive_score_result.intonationScale}
+                  - audio_query.body.volumeScale: ${check_sentitive_score_result.volumeScale}
+
+            - 3-4.音声合成用クエリをVOICEVOX ENGINEにリクエストし、生成されたwavデータをtmpバケットに格納する:
+                call: http.post
+                args:
+                  url: ${cloud_function_baseurl + "/generate_audio_upload_tmp"}
+                  body:
+                    speaker_id: ${check_sentitive_score_result.speaker_id}
+                    audio_query: ${audio_query.body}
+                    workflow_id: ${sys.get_env("GOOGLE_CLOUD_WORKFLOW_EXECUTION_ID")}
+                    step: ${openai_script_structure.step}
+                  auth:
+                    type: OIDC
+
+            - 台本情報を変数に書き込みする:
+                assign:
+                  - tmp_drama_script: ${openai_script_structure.speaker + ":" + openai_script_structure.text + "("+ analyzeSentimentResult.documentSentiment.score + "," + analyzeSentimentResult.documentSentiment.magnitude + ","+ check_sentitive_score_result.emotion +")"}
+                  - voice_drama_scripts: ${voice_drama_scripts + "\n" + tmp_drama_script}
+
+    - 4.Tmpバケットに投下したwavファイルをVOICEVOX ENGINEで結合し、wavデータをm4aデータに変換し公開バケットにPOSTしてそのオブジェクトの公開URLを取得する:
+        call: http.post
+        args:
+            url: ${cloud_function_baseurl + "/concatenate_wav_translate_m4a"}
+            body:
+                workflow_id : ${sys.get_env("GOOGLE_CLOUD_WORKFLOW_EXECUTION_ID")}
+            auth:
+                type: OIDC
+        result: result_concatenate_wav_files
+
+    - 5.リクエストパラメータのis_post_messages_line_botを参照し、真ならLINE BOTに台本テキスト、音声ファイルを配信する:
+            switch: 
+              - condition: ${is_post_messages_line_bot == 1}
+                call: PostMessagesLineBot
+                args:
+                    detail_text : ${voice_drama_scripts}
+                    public_audio_url: ${result_concatenate_wav_files.body.public_audio_url}
+                    audio_duration: ${result_concatenate_wav_files.body.audio_duration}
+
+    - 6.Loggingに処理結果を書き込む:
+        call: Logging
+        args:
+            detail_text : ${voice_drama_scripts}
+            public_audio_url: ${result_concatenate_wav_files.body.public_audio_url}
+            audio_duration: ${result_concatenate_wav_files.body.audio_duration}
+
+    - 7.終了:
+        return : "OK"
+
+GetSecretValue:
+    params: [secret_id]
+    steps:
+        - 1.SecretManagerから特定のSecret値を取得:
+            call: googleapis.secretmanager.v1.projects.secrets.versions.accessString
+            args:
+                secret_id: ${secret_id}
+                version: "latest"
+                project_id: ${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}
+            result: acccess_string
+        - 2.返却:
+            return: ${acccess_string}
+
+PostMessagesLineBot:
+    params: [detail_text,public_audio_url,audio_duration]
+    steps:
+        - 変数初期化:
+            assign:
+                - post_message_url : "https://api.line.me/v2/bot/message/broadcast"
+
+                - text_object:
+                      type: "text"
+                      text: ${detail_text}
+
+                - audio_messages_object:
+                      type: "audio"
+                      originalContentUrl : ${public_audio_url}
+                      duration: ${audio_duration}
+
+        - 1.line_channel_access_tokens取得:
+            call: GetSecretValue
+            args:
+                secret_id: "line_channel_access_tokens"
+            result: channel_access_tokens
+
+        - 2.LINE BOTに通知:
+            call: http.post
+            args:
+                url: ${post_message_url}
+                headers:
+                    Content-Type : application/json
+                    Authorization : ${"Bearer " + channel_access_tokens}
+                body:
+                    messages:
+                        - ${text_object}
+                        - ${audio_messages_object}
+
+GetOpenAISentense:
+    params: []
+    steps:
+        - 変数初期化:
+            assign:
+                - open_ai_model: "gpt-3.5-turbo"
+                - open_ai_messages: 
+                    [
+                    {"role": "user", "content": "ずんだもんという名の少女と、めたんという名の少女が存在するとします。"},
+                    {"role": "user", "content": "ずんだもんは、めたんから呼び捨てにされています。。"},
+                    {"role": "user", "content": "ずんだもんは語尾に「なのだ」や「のだ」を付けてしゃべます。丁寧語は使いません。一人称は「ずんだもん」です。"},
+                    {"role": "user", "content": "ずんだもんはめたんを「めたん」と呼び捨てにします。"},
+                    {"role": "user", "content": "めたんは丁寧語は使いません。お嬢様ですが貧しいです。一人称は「私」です。"},
+                    {"role": "system", "content": "上記の前提で会話形式の脚本を作成してください。"},
+                    {"role": "system", "content": "会話は、改行区切りで以下のフォーマットを必ず守ってください。\n(登場人物名):(会話本文)"},
+                    ]
+                - open_ai_n : 1
+                - open_ai_temperature : 1.1
+                - open_ai_presence_penalty : 0
+                - open_ai_frequency_penalty : 0
+                - open_ai_max_tokens : 3500
+
+        - 1.open_ai_api_key取得:
+            call: GetSecretValue
+            args:
+                secret_id: "open_ai_api_key"
+            result: open_ai_api_key
+
+        - 2.OpenAIにリクエスト:
+            call: http.post
+            args:
+                url: https://api.openai.com/v1/chat/completions
+                timeout: 1800
+                headers:
+                    Content-Type: application/json
+                    Authorization: ${"Bearer " + open_ai_api_key}
+                body:
+                    model : ${open_ai_model}
+                    messages : ${open_ai_messages}
+                    n : ${open_ai_n}
+                    presence_penalty: ${open_ai_presence_penalty}
+                    frequency_penalty: ${open_ai_frequency_penalty}
+                    temperature : ${open_ai_temperature}
+                    max_tokens : ${open_ai_max_tokens}
+            result: result
+
+        - 3.返却:
+            return : ${result.body.choices[0].message.content}
+
+CheckSentitiveScore:
+    params: [speaker_str, score, magnitude]
+    steps:
+        - 変数初期化:
+            assign:
+                - result : {}
+
+        - 1.制御値テスト:
+            switch: 
+                # 明らかにポジティブ == 喜
+                - condition: ${score >= 0.2 and magnitude >= 0.8}
+                  call: PositiveSet
+                  args:
+                     result: ${result}
+                     speaker_str: ${speaker_str}
+                  result : result
+                  next: 3.返却
+
+                # 明らかにネガティブ == 怒(激おこ)
+                - condition: ${score <= -0.2 and magnitude >= 1.2}
+                  call: BigNegativeSet
+                  args:
+                     result: ${result}
+                     speaker_str: ${speaker_str}
+                  result : result
+                  next: 3.返却
+                  
+                # ネガティブ == 怒(ちょいおこ)
+                - condition: ${score <= -0.2 and magnitude >= 0.5}
+                  call: SmallNegativeSet
+                  args:
+                     result: ${result}
+                     speaker_str: ${speaker_str}
+                  result : result
+                  next: 3.返却
+            
+        - 2.ニュートラル:
+            call: NeutralSet
+            args:
+                result: ${result}
+                speaker_str: ${speaker_str}
+            result : result
+
+        - 3.返却:
+            return : ${result}
+
+PositiveSet:
+    params: [result, speaker_str]
+    steps:
+        - ポジティブ:
+            assign:
+                - result.emotion: "ポジティブ"
+                - result.speedScale : 1.2
+                - result.pitchScale: 0.08
+                - result.intonationScale : 1
+                - result.volumeScale : 1.6
+
+        - すんだもんorめたん(ポジティブ):
+            switch:
+                - condition: ${speaker_str == "ずんだもん"}
+                  steps:
+                    - ずんだもん(あまあま):
+                        assign:
+                            - result.speaker_id: 1
+                        
+                - condition: ${speaker_str == "めたん"}
+                  steps:
+                    - めたん(あまあま):
+                        assign:
+                            - result.speaker_id: 0
+        - 返却:
+            return : ${result}
+
+BigNegativeSet:
+    params: [result, speaker_str]
+    steps:
+        - ネガティブ:
+            assign:
+                - result.emotion: "ネガティブ"
+                - result.speedScale : 1.65
+                - result.pitchScale: 0.07
+                - result.intonationScale : 1.4
+                - result.volumeScale : 2.0
+
+        - 1.すんだもんorめたん(ツンツン):
+            switch:
+                - condition: ${speaker_str == "ずんだもん"}
+                  steps:
+                    - ずんだもん(ツンツン):
+                        assign:
+                            - result.speaker_id: 7
+                        
+                - condition: ${speaker_str == "めたん"}
+                  steps:
+                    - めたん(ツンツン):
+                        assign:
+                            - result.speaker_id: 6
+        - 2.返却:
+                return : ${result}
+
+SmallNegativeSet:
+    params: [result, speaker_str]
+    steps:
+        - ややネガティブ:
+            assign:
+                - result.emotion: "ややネガティブ"
+                - result.speedScale : 0.8
+                - result.pitchScale: -0.1
+                - result.intonationScale : 1.0
+                - result.volumeScale : 1.6
+
+        - 1.すんだもんorめたん(ツンツン):
+            switch:
+                - condition: ${speaker_str == "ずんだもん"}
+                  steps:
+                    - ずんだもん(ツンツン):
+                        assign:
+                            - result.speaker_id: 7
+                        
+                - condition: ${speaker_str == "めたん"}
+                  steps:
+                    - めたん(ツンツン):
+                        assign:
+                            - result.speaker_id: 6
+        - 2.返却:
+                return : ${result}
+
+NeutralSet:
+    params: [result, speaker_str]
+    steps:
+        - 通常:
+            assign:
+                - result.emotion: "通常"
+                - result.speedScale : 1.0
+                - result.pitchScale: 0
+                - result.intonationScale : 1
+                - result.volumeScale : 1.0
+
+        - 1.すんだもんorめたん(通常):
+            switch:
+                - condition: ${speaker_str == "ずんだもん"}
+                  steps:
+                    - ずんだもん(通常):
+                        assign:
+                            - result.speaker_id: 1
+                        
+                - condition: ${speaker_str == "めたん"}
+                  steps:
+                    - めたん(通常):
+                        assign:
+                            - result.speaker_id: 2
+        - 2.返却:
+                return : ${result}
+
+Logging:
+    params: [detail_text,public_audio_url,audio_duration]
+    steps:
+        - 変数初期化:
+            assign:
+                - ar_test :
+                      detail_text : ${detail_text}
+                      public_audio_url : ${public_audio_url}
+                      audio_duration : ${audio_duration}
+
+        - 1.ログ書き込み:
+            call: sys.log
+            args:
+                severity: "DEBUG"
+                json: ${ar_test}
+                
