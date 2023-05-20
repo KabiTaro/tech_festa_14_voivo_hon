@@ -26,7 +26,6 @@ def main(request):
     if open_ai_text is None:
         return jsonify({'message': 'open_ai_text is missing'}), 400
 
-    # 読み込んだ内容を表示する
     ar_content = [re.sub(REMOVE_REGEX_PATTERN, '', text)
                   for text in open_ai_text.split("\n") if text != '']
     ar_return = []
